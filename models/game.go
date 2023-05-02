@@ -2,6 +2,7 @@ package models
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -14,20 +15,21 @@ type Cell struct {
 
 type Minesweeper struct {
 	Board [][]Cell
+	Mu    sync.Mutex
 	Rows  int
 	Cols  int
 }
 
-func NewMinesweeper(rows int, cols int) *Minesweeper {
-	board := make([][]Cell, rows)
+func NewMinesweeper(boardSize int) *Minesweeper {
+	board := make([][]Cell, boardSize)
 	for i := range board {
-		board[i] = make([]Cell, cols)
+		board[i] = make([]Cell, boardSize)
 	}
 
 	return &Minesweeper{
 		Board: board,
-		Rows:  rows,
-		Cols:  cols,
+		Rows:  boardSize,
+		Cols:  boardSize,
 	}
 }
 

@@ -1,7 +1,9 @@
 package game
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -11,26 +13,18 @@ import (
 	"github.com/dimaq12/minesweaper/models"
 )
 
-type TaskType int
-
-const (
-	RenderTaskType TaskType = iota
-	ShowTaskType
-	RevealAllTaskType
-)
-
-type Task struct {
-	Type TaskType
-	Row  int
-	Col  int
+type ShowTask struct {
+	Row int
+	Col int
 }
 
-func NewTask(taskType TaskType, row, col int) *Task {
-	return &Task{Type: taskType, Row: row, Col: col}
+func NewShowTask(row, col int) *ShowTask {
+	return &ShowTask{Row: row, Col: col}
 }
 
 type GameService interface {
 	InitGame(bSize int, mineQ int)
+	EndGame()
 	showCell(row, col int)
 	flagCell(row, col int)
 	isGameOver() (bool, bool)
@@ -38,11 +32,16 @@ type GameService interface {
 }
 
 type MinesweeperService struct {
-	game         *models.Minesweeper
-	renderer     *Renderer
-	app          *tview.Application
-	mineQuantity int
-	tasks        chan *Task
+	game            *models.Minesweeper
+	logger          io.Writer
+	renderer        *Renderer
+	app             *tview.Application
+	mineQuantity    int
+	cancelFunc      context.CancelFunc
+	showTasks       chan *ShowTask
+	rerenderTasks   chan struct{}
+	checkGameStatus chan struct{}
+	revealAllBoard  chan struct{}
 }
 
 func NewMinesweeperService(game *models.Minesweeper) *MinesweeperService {
@@ -54,20 +53,31 @@ func NewMinesweeperService(game *models.Minesweeper) *MinesweeperService {
 }
 
 func (s *MinesweeperService) InitGame(bSize int, mineQ int) {
-	s.game = models.NewMinesweeper(bSize, bSize)
+	s.game = models.NewMinesweeper(bSize)
 	s.game.PlaceMinesRandomly(mineQ)
 	s.mineQuantity = mineQ
 	s.renderer.DrawBoard(s.game)
 	s.app = tview.NewApplication()
 	s.app.SetRoot(s.renderer.boardTable, true)
-	s.tasks = make(chan *Task)
-	go s.taskPipeline()
+	s.showTasks = make(chan *ShowTask)
+	s.rerenderTasks = make(chan struct{})
+	s.checkGameStatus = make(chan struct{})
+	s.revealAllBoard = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.TODO())
+	s.cancelFunc = cancel
+	go s.run(ctx)
 
 	s.handleInput()
 
 	if err := s.app.Run(); err != nil {
 		panic(err)
 	}
+}
+
+func (s *MinesweeperService) EndGame() {
+	s.app.Stop()
+	s.cancelFunc()
+	os.Exit(0)
 }
 
 // ifCellValid takes a cell's row and col coordinates as input and returns
@@ -117,22 +127,23 @@ func (s *MinesweeperService) countNearbyMines(row, col int) int {
 // the cell, updating its IsShown state and the number of nearby mines.
 // If the shown cell has zero nearby mines, it recursively show
 // all neighboring cells that are not already shown.
-func (s *MinesweeperService) showCell(row, col int) {
+func (s *MinesweeperService) showCell(row, col int, recursive bool) {
 	// Check if the given row and col are within the borders of the game board,
 	// and if the cell is already shown. If either of these conditions is true,
 	// the function returns immediately without revealing the cell.
 	if !s.ifCellValid(row, col) || s.game.Board[row][col].IsShown {
 		return
 	}
+	s.game.Mu.Lock()
 
 	// Set the cell's IsShown property to true, indicating that it has been shown.
-	s.game.Board[row][col].IsShown = true
+	if s.game.Board[row][col].IsFlagged == !true {
+		s.game.Board[row][col].IsShown = true
+	}
+
 	// Update the cell's nearbyMines property with the count of nearby mines.
 	s.game.Board[row][col].NearbyMines = s.countNearbyMines(row, col)
-
-	// Send a RenderTaskType task to the task pipeline to update the UI for the shown cell.
-	// To-do fix the issue with deadlock
-	s.tasks <- NewTask(RenderTaskType, row, col)
+	s.game.Mu.Unlock()
 
 	// If the shown cell has no nearby mines (i.e., nearbyMines is 0),
 	// recursively reveal all neighboring cells.
@@ -145,40 +156,48 @@ func (s *MinesweeperService) showCell(row, col int) {
 					continue
 				}
 				// Recursively call showCell for the neighboring cell.
-				go s.showCell(row+deltaRow, col+deltaCol)
+				s.showCell(row+deltaRow, col+deltaCol, true)
 			}
 		}
 	}
+	s.rerenderTasks <- struct{}{}
+	s.checkGameStatus <- struct{}{}
 }
 
 // Show all the cells on the board
 func (s *MinesweeperService) revealAll() {
+	s.game.Mu.Lock()
 	for row := 0; row < s.game.Rows; row++ {
 		for col := 0; col < s.game.Cols; col++ {
 			s.game.Board[row][col].IsShown = true
-			s.tasks <- NewTask(RenderTaskType, row, col) // Send a Render task
 		}
 	}
+	s.game.Mu.Unlock()
+	s.rerenderTasks <- struct{}{}
 }
 
-func (s *MinesweeperService) isGameOver() (bool, bool) {
-	unShownNonMineCells := 0
+func (s *MinesweeperService) isWinOrGameOver() (bool, bool) {
+	shownNonMineCells := 0
+	allCells := s.game.Rows * s.game.Cols
+	s.game.Mu.Lock()
 	for row := 0; row < s.game.Rows; row++ {
 		for col := 0; col < s.game.Cols; col++ {
 			cell := s.game.Board[row][col]
 			if cell.IsShown {
 				if cell.IsMine {
 					// If a shown cell is a mine, the player has lost.
+					s.game.Mu.Unlock()
 					return true, false
 				} else {
-					unShownNonMineCells++
+					shownNonMineCells++
 				}
 			}
 		}
 	}
+	s.game.Mu.Unlock()
 
 	// If all non-mine cells are shown, the player has won.
-	if unShownNonMineCells == s.mineQuantity {
+	if allCells-shownNonMineCells == s.mineQuantity {
 		return true, true
 	}
 
@@ -186,57 +205,100 @@ func (s *MinesweeperService) isGameOver() (bool, bool) {
 	return false, false
 }
 
+// Flag Cell
 func (s *MinesweeperService) flagCell(row, col int) {
 	if s.ifCellValid(row, col) {
 		s.game.Board[row][col].IsFlagged = !s.game.Board[row][col].IsFlagged
 	}
 }
 
-func (s *MinesweeperService) taskPipeline() {
-	for task := range s.tasks {
-		switch task.Type {
-		case ShowTaskType:
-			go s.showCell(task.Row, task.Col)
-			fallthrough
-		case RenderTaskType:
-			go s.renderer.RenderCell(s.game, task.Row, task.Col)
-		case RevealAllTaskType:
-			s.revealAll()
-		}
-	}
-}
-
-// To-do fix the issue with rerender in the case when game is lost
+// Handle input
 func (s *MinesweeperService) handleInput() {
 	s.renderer.boardTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// Get coordinate of input
 		row, col := s.renderer.boardTable.GetSelection()
 
 		switch event.Key() {
+		// If enter was pressed
 		case tcell.KeyEnter:
-			s.tasks <- NewTask(ShowTaskType, row, col) // Send a Reveal task
-			gameOver, gameWon := s.isGameOver()
-			if gameOver {
-				if gameWon {
-					time.Sleep(1 * time.Second)
-					s.app.Stop()
-					fmt.Println("Congratulations! You won the game!")
-				} else {
-					s.tasks <- NewTask(RevealAllTaskType, row, col)
-					time.Sleep(1 * time.Second)
-					s.app.Stop()
-					fmt.Println("Game Over! You hit a mine.")
-				}
-				os.Exit(0)
-			}
+			s.showTasks <- NewShowTask(row, col) // Send a Show task
 
+		// If F or Q was pressed
 		case tcell.KeyRune:
 			switch event.Rune() {
 			case 'f', 'F':
 				s.flagCell(row, col)
+				s.rerenderTasks <- struct{}{}
+			case 'q', 'Q':
+				s.EndGame()
 			}
 		}
-		s.tasks <- NewTask(RenderTaskType, row, col) // Send a Render task
-
 		return event
 	})
+}
+
+// Run all listeners
+func (s *MinesweeperService) run(ctx context.Context) {
+	go func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case task := <-s.showTasks:
+				s.showCell(task.Row, task.Col, true)
+			}
+		}
+	}(ctx)
+
+	go func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.rerenderTasks:
+				s.app.QueueUpdateDraw(func() {
+					s.renderer.DrawBoard(s.game)
+				})
+			}
+		}
+
+	}(ctx)
+
+	go func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.revealAllBoard:
+				s.revealAll()
+			}
+		}
+
+	}(ctx)
+
+	go func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.checkGameStatus:
+				gameOver, gameWon := s.isWinOrGameOver()
+
+				if gameOver {
+					if gameWon {
+						s.revealAllBoard <- struct{}{}
+						time.Sleep(5 * time.Second)
+						s.app.Stop()
+						fmt.Println("Congratulations! You won the game!")
+					} else {
+						s.revealAllBoard <- struct{}{}
+						time.Sleep(5 * time.Second)
+						s.app.Stop()
+						fmt.Println("Game Over! You hit a mine.")
+					}
+					os.Exit(0)
+				}
+			}
+		}
+	}(ctx)
 }

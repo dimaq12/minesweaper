@@ -29,6 +29,8 @@ func (r *Renderer) DrawBoard(game *models.Minesweeper) {
 }
 
 func (r *Renderer) RenderCell(game *models.Minesweeper, row, col int) {
+	game.Mu.Lock()
+	defer game.Mu.Unlock()
 	cell := game.Board[row][col]
 
 	cellText := "."
