@@ -1,6 +1,6 @@
 # minesweaper
 ## Description
-The simple replica of the minesweaper game written in go \
+The simple replica of the minesweaper game written in go
 ## Instalation
 To run the game just clone the repo go into build dir ```cd build``` and run ```./minesweaper``` (The binary was built on Ubuntu 20.04) \
 To run the source code you can [install Go](https://go.dev/doc/install) on your machine and run ```go run .``` in the root of repo.
